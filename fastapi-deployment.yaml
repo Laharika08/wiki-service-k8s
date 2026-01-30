@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wiki-service
+  namespace: wiki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wiki-service
+  template:
+    metadata:
+      labels:
+        app: wiki-service
+    spec:
+      containers:
+        - name: wiki-service
+          image: wiki-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000

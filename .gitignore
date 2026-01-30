@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.idea/
+.vscode/
+*.log
+*.db
+.kube/
+.minikube/
+
+# Local / editor junk
+.python-version
+.claude/
+[internal]
+exporting
+naming
+transferring
+writing
+=
+CACHED
+
