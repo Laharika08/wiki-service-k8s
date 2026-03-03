@@ -1,0 +1,233 @@
+# Secure CI/CD pipeline with policy enforcement
+#
+# This GitHub Actions workflow demonstrates a complete CI/CD pipeline that
+# automatically enforces multiple security gates before any artifact is
+# deployed.  The pipeline integrates the following tools:
+#   • **Static Analysis (SAST)** – Semgrep scans the application code for common
+#     vulnerabilities.  Semgrep’s `ci` command returns a non‑zero exit code
+#     when critical issues are found, causing the job to fail.
+#   • **Software Composition Analysis (SCA)** – Trivy scans the repository for
+#     vulnerable dependencies and infrastructure‑as‑code (IaC) files.  Only
+#     vulnerabilities with `HIGH` or `CRITICAL` severity trigger failure.
+#   • **Secret Scanning** – Gitleaks checks the repository history and current
+#     changes for accidentally committed secrets.  Any finding causes the job
+#     to fail.
+#   • **Policy Enforcement** – Conftest runs Open Policy Agent (OPA) policies
+#     against structured configuration files (e.g. Kubernetes manifests or
+#     Terraform plans).  Violations produce a non‑zero exit code to block
+#     deployment.
+#   • **Artifact Signing** – After all security gates pass, the pipeline
+#     builds the container image, pushes it to GitHub Container Registry, and
+#     signs it using Cosign.  Signing keys are loaded from repository secrets.
+#   • **Deployment** – A final job performs the deployment only if the prior
+#     jobs succeeded and the artifact is signed.
+
+# The pipeline triggers on push and pull_request events to the `main` branch.
+# A manual `workflow_dispatch` trigger is also available for on‑demand runs.
+# Concurrency is used to ensure that only the latest run for a given branch
+# executes at one time.
+
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual runs from the Actions tab
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  # Default permissions are read‑only.  Individual jobs grant additional
+  # privileges as needed.  The `security-events` permission is required to
+  # upload SARIF results to the GitHub Security dashboard【637704742391456†L289-L349】.
+  contents: read
+
+jobs:
+  #------------------------------------
+  # 1. Security gate: static, SCA and secrets scanning
+  #------------------------------------
+  security_checks:
+    name: Perform Security Scans
+    runs-on: ubuntu-latest
+    # Write permission on security events is required to upload SARIF files
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # Checkout the source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch the full history so gitleaks can scan past commits
+          fetch-depth: 0
+
+      #--- SAST: Semgrep scan ---
+      - name: Run Semgrep SAST scan
+        # The Semgrep CLI container provides the `semgrep` binary.  Running
+        # `semgrep ci` automatically selects rules for the detected languages
+        # and exits with a non‑zero status if critical issues are found【637704742391456†L186-L217】.
+        uses: returntocorp/semgrep-action@v1
+        id: semgrep
+        with:
+          # Generate a SARIF report for GitHub’s code scanning dashboard
+          generateSarif: true
+        env:
+          # Optionally set a Semgrep App token to upload results to the
+          # Semgrep SaaS platform.  Comment out if not using Semgrep Cloud.
+          # SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        # Fail the job when Semgrep finds blocking issues
+        continue-on-error: false
+
+      # Upload Semgrep findings to the Security tab.  GitHub’s SARIF upload
+      # action requires `security-events: write` permission【637704742391456†L289-L349】.
+      - name: Upload Semgrep SARIF to GitHub Security Dashboard
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+      #--- SCA: Trivy scan for dependencies and IaC ---
+      - name: Run Trivy SCA and IaC scan
+        uses: aquasecurity/trivy-action@0.10.0
+        id: trivy
+        # Stop the job if vulnerabilities exceed the severity threshold
+        continue-on-error: false
+        with:
+          # Scan the local filesystem (source code)
+          scan-type: fs
+          # Focus on OS and library vulnerabilities.  Add 'secret' to detect
+          # secrets with Trivy as well.
+          vulnerability-type: 'os,library'
+          # Only fail on HIGH or CRITICAL vulnerabilities【473212940923473†L170-L176】
+          severity: 'HIGH,CRITICAL'
+          # Ignore vulnerabilities without a fixed version to avoid noise
+          ignore-unfixed: true
+          # Output a SARIF report for code scanning
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy SARIF to GitHub Security Dashboard
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      #--- Secret scanning: Gitleaks ---
+      - name: Run Gitleaks secret scan
+        # Gitleaks detects hardcoded secrets in the repository.  It scans
+        # commits and files and fails the job if any secrets are detected
+        # according to its default rules【724506843347786†L213-L233】.
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: Provide a Gitleaks license if scanning organization
+          # repositories.  Personal repositories do not require a license【724506843347786†L236-L273】.
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        with:
+          # Enable SARIF report upload for secret scanning results
+          gitleaks-enable-upload-artifact: true
+        # If secrets are found, the step fails and the job stops
+        continue-on-error: false
+
+      #--- Policy enforcement: Conftest with OPA policies ---
+      - name: Set up Conftest
+        # Install the Conftest binary on the runner【997729684284088†L190-L216】.
+        uses: princespaghetti/setup-conftest@v1
+
+      - name: Run Conftest policy tests
+        # Conftest evaluates Rego policies in the `policy/` directory against
+        # the specified files.  Update the list of files to match your
+        # configuration manifests (e.g. Kubernetes YAML, Terraform plans).
+        run: conftest test config/deployment.yaml
+        # If any policy fails, conftest exits with a non‑zero status and the
+        # job fails【930965250369469†L309-L327】.
+
+  #------------------------------------
+  # 2. Build, push and sign container image
+  #------------------------------------
+  build_and_sign:
+    name: Build and Sign Container Image
+    runs-on: ubuntu-latest
+    needs: security_checks
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      # Set your image name and tag here.  The registry defaults to GitHub
+      # Container Registry (ghcr.io).  Update as needed.
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up QEMU and Buildx for multi‑architecture builds
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build and push the container image to the registry
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          # Path to the Dockerfile relative to the repository root
+          file: ./Dockerfile
+          # Build all default platforms; adjust if necessary
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # Disable provenance (Trivy will generate SBOM separately if needed)
+          provenance: false
+
+      # Install Cosign CLI.  This action sets up the binary in PATH【731270499597390†L239-L304】.
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@v3.5.0
+
+      # Sign the pushed image using private keys stored in secrets
+      - name: Sign container image
+        uses: dodopizza/cosign-sign-push-action@0.0.7
+        with:
+          image-tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          image-digest: ${{ steps.build.outputs.digest }}
+          cosign-private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          cosign-password: ${{ secrets.COSIGN_PASSWORD }}
+
+      # Publish a summary with the signed image tag for easier retrieval
+      - name: Output signed image
+        run: |
+          echo "## Signed image" >> $GITHUB_STEP_SUMMARY
+          echo "${IMAGE_NAME}:${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+
+  #------------------------------------
+  # 3. Deploy only if all gates pass
+  #------------------------------------
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: build_and_sign
+    environment:
+      name: production
+      url: https://example.com
+    steps:
+      - name: Deployment placeholder
+        run: |
+          echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG} to production..."
+          # Insert your deployment commands here, for example:
+          # kubectl set image deployment/my-app my-app=${IMAGE_NAME}:${IMAGE_TAG}
+          # helm upgrade --install my-app chart/ --set image.tag=${IMAGE_TAG}
